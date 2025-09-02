@@ -1,11 +1,12 @@
 name: Generate Controllers PlantUML
 
 on:
-  workflow_dispatch: # Allows manual trigger from GitHub Actions tab
+  workflow_dispatch:  # manual trigger from the Actions tab
 
 jobs:
   build:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -15,17 +16,246 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Generate controllers.puml
+      - name: Generate controllers.puml (write script + run)
         run: |
           mkdir -p scripts doc
+
           cat > scripts/generate_controllers_puml.py << 'PY'
-# (Paste the Python script from my previous message here)
+#!/usr/bin/env python3
+import re, sys
+from pathlib import Path
+
+# Usage:
+#   python3 scripts/generate_controllers_puml.py src/main/java doc/controllers.puml
+#
+# What it does:
+# - Finds classes that look like Spring MVC controllers (ends with *Controller, or annotated with @RestController/@Controller)
+# - Extracts public methods that are mapped via @GetMapping/@PostMapping/@PutMapping/@DeleteMapping/@PatchMapping/@RequestMapping
+# - Detects common DI dependencies (fields or constructor params) with names ending in Service/Repository/Client/Manager/Facade
+# - Emits a PlantUML class diagram focused on controllers, with arrows to the detected dependencies.
+
+SRC_DIR = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("src/main/java")
+OUT = Path(sys.argv[2]) if len(sys.argv) > 2 else Path("controllers.puml")
+
+# ---- regex helpers ----
+TYPE = r"[A-Za-z_][\w.<>\[\]]*"
+PKG_RE = re.compile(r"package\s+([a-zA-Z0-9_.]+)\s*;")
+CLASS_RE = re.compile(r"\bclass\s+([A-Za-z_]\w*)\b")
+IS_CONTROLLER_RE = re.compile(r"@RestController\b|@Controller\b")
+CTRL_NAME_RE = re.compile(r"\b([A-Za-z_]\w*Controller)\b")
+MAP_ANNOS = ("@GetMapping", "@PostMapping", "@PutMapping", "@DeleteMapping", "@PatchMapping", "@RequestMapping")
+METHOD_RE = re.compile(rf"\b(public|protected|private)?\s*(static\s+)?({TYPE})\s+([A-Za-z_]\w*)\s*\(([^)]*)\)\s*\{{", re.M)
+FIELD_RE = re.compile(rf"(?:@\w+(?:\([^)]*\))?\s*)*(?:private|protected|public)\s+(final\s+)?({TYPE})\s+([a-zA-Z_]\w*)\s*;", re.M)
+CTOR_RE_TMPL = r"\bpublic\s+{cls}\s*\(([^)]*)\)"
+
+DEP_SUFFIX_RE = re.compile(r"(Service|Repository|Client|Manager|Facade)\b")
+
+def sanitize_type(t: str) -> str:
+    # Strip generics and fully qualified names => keep simple names
+    t = re.sub(r"<[^>]+>", "", t)
+    t = t.split(".")[-1]
+    t = t.replace("[]", "[]")
+    t = t.strip()
+    return t
+
+def parse_params(sig: str):
+    sig = sig.strip()
+    if not sig:
+        return []
+    parts = []
+    for raw in split_params(sig):
+        p = re.sub(r"@\w+(?:\([^)]*\))?\s*", "", raw.strip())  # drop annotations on params
+        # Handle varargs (Type... name) and multiple spaces
+        tokens = [tok for tok in re.split(r"\s+", p) if tok]
+        if len(tokens) >= 2:
+            ptype = sanitize_type(" ".join(tokens[:-1]).replace("...", "[]"))
+            pname = tokens[-1]
+        else:
+            # Fallback if parameter name missing
+            ptype, pname = sanitize_type(tokens[0]), "arg"
+        parts.append((pname, ptype))
+    return parts
+
+def split_params(sig: str):
+    # Split method params by commas while ignoring commas inside generics or parentheses
+    out, depth_lt, depth_paren = [], 0, 0
+    cur = []
+    for ch in sig:
+        if ch == '<': depth_lt += 1
+        elif ch == '>': depth_lt = max(0, depth_lt - 1)
+        elif ch == '(': depth_paren += 1
+        elif ch == ')': depth_paren = max(0, depth_paren - 1)
+        if ch == ',' and depth_lt == 0 and depth_paren == 0:
+            out.append("".join(cur))
+            cur = []
+        else:
+            cur.append(ch)
+    if cur:
+        out.append("".join(cur))
+    return out
+
+def looks_like_controller(text: str, cls_name: str) -> bool:
+    if IS_CONTROLLER_RE.search(text):
+        return True
+    if cls_name.endswith("Controller"):
+        return True
+    return False
+
+def is_mapped_method(before: str) -> bool:
+    return any(a in before for a in MAP_ANNOS)
+
+def collect_dependencies_from_fields(text: str):
+    deps = set()
+    for _final, ftype, _fname in FIELD_RE.findall(text):
+        simple = sanitize_type(ftype)
+        if DEP_SUFFIX_RE.search(simple):
+            deps.add(simple)
+    return deps
+
+def collect_dependencies_from_constructor(text: str, cls: str):
+    deps = set()
+    ctor_re = re.compile(CTOR_RE_TMPL.format(cls=re.escape(cls)))
+    m = ctor_re.search(text)
+    if not m:
+        return deps
+    params = parse_params(m.group(1))
+    for _pname, ptype in params:
+        simple = sanitize_type(ptype)
+        if DEP_SUFFIX_RE.search(simple):
+            deps.add(simple)
+    return deps
+
+def method_return_simplify(ret: str) -> str:
+    # ResponseEntity<Foo> -> ResponseEntity, Optional<Bar> -> Optional
+    return sanitize_type(ret)
+
+controllers = {}  # name -> { package, methods: [(name, [(pname,ptype)], ret)], deps:set[str] }
+
+java_files = list(SRC_DIR.rglob("*.java"))
+
+for file in java_files:
+    try:
+        text = file.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        continue
+
+    # package
+    pkg_m = PKG_RE.search(text)
+    pkg = pkg_m.group(1) if pkg_m else ""
+
+    # class name (first hit)
+    cls_m = CLASS_RE.search(text)
+    if not cls_m:
+        continue
+    cls_name = cls_m.group(1)
+
+    # expand controller class name if not exactly matched
+    ctrl_m = CTRL_NAME_RE.search(text)
+    if ctrl_m:
+        cls_name = ctrl_m.group(1) if ctrl_m.group(1).endswith("Controller") else cls_name
+
+    if not looks_like_controller(text, cls_name):
+        continue
+
+    # find mapped methods
+    methods = []
+    for m in METHOD_RE.finditer(text):
+        # window before method signature for checking mapping annotations
+        start_idx = m.start()
+        before = text[max(0, start_idx - 500):start_idx]
+        if not is_mapped_method(before):
+            continue
+        _vis, _static, ret, name, sig = m.group(1), m.group(2), m.group(3), m.group(4), m.group(5)
+        params = parse_params(sig)
+        methods.append((name, params, method_return_simplify(ret)))
+
+    # find deps from fields and constructor
+    deps = collect_dependencies_from_fields(text)
+    deps |= collect_dependencies_from_constructor(text, cls_name)
+
+    controllers[cls_name] = dict(package=pkg, methods=methods, deps=deps)
+
+# Gather unique dependencies to declare as stub classes
+all_deps = set()
+for c in controllers.values():
+    all_deps |= c["deps"]
+
+# ---- write PlantUML ----
+OUT.parent.mkdir(parents=True, exist_ok=True)
+with OUT.open("w", encoding="utf-8") as f:
+    f.write("@startuml\n")
+    f.write("title Controllers Diagram\n")
+    f.write("hide empty members\n")
+    f.write("skinparam classAttributeIconSize 0\n")
+    f.write("skinparam classBackgroundColor #ffffff\n")
+    f.write("skinparam classBorderColor #888\n")
+    f.write("skinparam ArrowColor #666\n\n")
+
+    # Optionally group controllers by their package's last token if it contains 'controller'
+    # Otherwise, place class flatly
+    def pkg_token(p):
+        toks = p.split(".")
+        return toks[-1] if toks else ""
+
+    # First, build mapping: group -> [classes]
+    groups = {}
+    for cls, data in controllers.items():
+        token = pkg_token(data["package"]).lower()
+        group = "controller" if "controller" in token else token
+        groups.setdefault(group, []).append((cls, data))
+
+    for group, items in sorted(groups.items()):
+        if group and group not in ("", "java", "main"):
+            f.write(f'package "{group}" {{\n')
+        for cls, data in sorted(items, key=lambda x: x[0]):
+            f.write(f"class {cls} {{\n")
+            for name, params, ret in data["methods"]:
+                param_str = ", ".join(f"{n}: {t}" for n, t in params)
+                f.write(f"  +{name}({param_str}) : {ret}\n")
+            f.write("}\n\n")
+        if group and group not in ("", "java", "main"):
+            f.write("}\n\n")
+
+    # Declare stub classes for dependencies so arrows have targets
+    for dep in sorted(all_deps):
+        if dep not in controllers:  # avoid re-declaring controllers
+            f.write(f"class {dep}\n")
+    if all_deps:
+        f.write("\n")
+
+    # Relations: Controller --> Dependency
+    for cls, data in controllers.items():
+        for dep in sorted(data["deps"]):
+            f.write(f"{cls} --> {dep}\n")
+
+    f.write("\n@enduml\n")
+
+print(f"Wrote {OUT} | controllers: {len(controllers)} | unique deps: {len(all_deps)}")
 PY
+
+          chmod +x scripts/generate_controllers_puml.py
           python3 scripts/generate_controllers_puml.py src/main/java doc/controllers.puml
+          echo "---- GENERATED FILE ----"
+          ls -lah doc
+          echo "First 40 lines for preview:"
+          head -n 40 doc/controllers.puml || true
+
+      # (Optional) Render image(s) with PlantUML (SVG + PNG) right on the runner
+      - name: Render PlantUML to SVG & PNG
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y graphviz curl
+          # download PlantUML jar (version can be updated anytime)
+          curl -L -o plantuml.jar https://repo1.maven.org/maven2/net/sourceforge/plantuml/plantuml/1.2024.7/plantuml-1.2024.7.jar
+          java -jar plantuml.jar -tsvg doc/controllers.puml
+          java -jar plantuml.jar -tpng doc/controllers.puml
           ls -lah doc
 
-      - name: Upload artifact
+      - name: Upload artifacts (.puml, .svg, .png)
         uses: actions/upload-artifact@v4
         with:
-          name: controllers.puml
-          path: doc/controllers.puml
+          name: controllers-diagram
+          path: |
+            doc/controllers.puml
+            doc/controllers.svg
+            doc/controllers.png
