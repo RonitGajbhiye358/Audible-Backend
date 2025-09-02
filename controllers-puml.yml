@@ -1,0 +1,198 @@
+name: Generate Controllers PlantUML
+
+on:
+  workflow_dispatch:  # run it manually from the Actions tab
+
+jobs:
+  controllers-diagram:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Generate controllers.puml (write script + run)
+        run: |
+          mkdir -p scripts doc
+
+          cat > scripts/generate_controllers_puml.py << 'PY'
+#!/usr/bin/env python3
+import re, sys
+from pathlib import Path
+
+# Usage:
+#   python3 scripts/generate_controllers_puml.py src/main/java doc/controllers.puml
+#
+# It:
+# - Finds Spring MVC controllers (class ends with *Controller or annotated with @RestController/@Controller)
+# - Captures request-mapped public methods (@GetMapping/@PostMapping/@PutMapping/@DeleteMapping/@PatchMapping/@RequestMapping)
+# - Detects DI deps whose type names end with Service/Repository/Client/Manager/Facade (fields or constructor params)
+# - Emits a PlantUML class diagram for controllers with arrows to these deps.
+
+SRC_DIR = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("src/main/java")
+OUT = Path(sys.argv[2]) if len(sys.argv) > 2 else Path("controllers.puml")
+
+TYPE = r"[A-Za-z_][\w.<>\[\]]*"
+PKG_RE = re.compile(r"package\s+([a-zA-Z0-9_.]+)\s*;")
+CLASS_RE = re.compile(r"\bclass\s+([A-Za-z_]\w*)\b")
+IS_CONTROLLER_RE = re.compile(r"@RestController\b|@Controller\b")
+CTRL_NAME_RE = re.compile(r"\b([A-Za-z_]\w*Controller)\b")
+MAP_ANNOS = ("@GetMapping", "@PostMapping", "@PutMapping", "@DeleteMapping", "@PatchMapping", "@RequestMapping")
+METHOD_RE = re.compile(rf"\b(public|protected|private)?\s*(static\s+)?({TYPE})\s+([A-Za-z_]\w*)\s*\(([^)]*)\)\s*\{{", re.M)
+FIELD_RE = re.compile(rf"(?:@\w+(?:\([^)]*\))?\s*)*(?:private|protected|public)\s+(final\s+)?({TYPE})\s+([a-zA-Z_]\w*)\s*;", re.M)
+CTOR_RE_TMPL = r"\bpublic\s+{cls}\s*\(([^)]*)\)"
+
+DEP_SUFFIX_RE = re.compile(r"(Service|Repository|Client|Manager|Facade)\b")
+
+def sanitize_type(t: str) -> str:
+    t = re.sub(r"<[^>]+>", "", t)
+    t = t.split(".")[-1]
+    t = t.replace("[]", "[]")
+    return t.strip()
+
+def split_params(sig: str):
+    out, depth_lt, depth_paren = [], 0, 0
+    cur = []
+    for ch in sig:
+        if ch == '<': depth_lt += 1
+        elif ch == '>': depth_lt = max(0, depth_lt - 1)
+        elif ch == '(': depth_paren += 1
+        elif ch == ')': depth_paren = max(0, depth_paren - 1)
+        if ch == ',' and depth_lt == 0 and depth_paren == 0:
+            out.append("".join(cur)); cur = []
+        else:
+            cur.append(ch)
+    if cur: out.append("".join(cur))
+    return out
+
+def parse_params(sig: str):
+    sig = sig.strip()
+    if not sig: return []
+    parts = []
+    for raw in split_params(sig):
+        p = re.sub(r"@\w+(?:\([^)]*\))?\s*", "", raw.strip())
+        tokens = [tok for tok in re.split(r"\s+", p) if tok]
+        if len(tokens) >= 2:
+            ptype = sanitize_type(" ".join(tokens[:-1]).replace("...", "[]"))
+            pname = tokens[-1]
+        else:
+            ptype, pname = sanitize_type(tokens[0]), "arg"
+        parts.append((pname, ptype))
+    return parts
+
+def looks_like_controller(text: str, cls_name: str) -> bool:
+    return bool(IS_CONTROLLER_RE.search(text) or cls_name.endswith("Controller"))
+
+def is_mapped(before: str) -> bool:
+    return any(a in before for a in MAP_ANNOS)
+
+def collect_deps_fields(text: str):
+    deps = set()
+    for _final, ftype, _fname in FIELD_RE.findall(text):
+        simple = sanitize_type(ftype)
+        if DEP_SUFFIX_RE.search(simple): deps.add(simple)
+    return deps
+
+def collect_deps_ctor(text: str, cls: str):
+    deps = set()
+    ctor_re = re.compile(CTOR_RE_TMPL.format(cls=re.escape(cls)))
+    m = ctor_re.search(text)
+    if not m: return deps
+    for _n, t in parse_params(m.group(1)):
+        simple = sanitize_type(t)
+        if DEP_SUFFIX_RE.search(simple): deps.add(simple)
+    return deps
+
+def ret_simplify(ret: str) -> str:
+    return sanitize_type(ret)
+
+controllers = {}  # name -> {package, methods[(name,[(n,t)],ret)], deps:set[str]}
+
+java_files = list(SRC_DIR.rglob("*.java"))
+for file in java_files:
+    try: text = file.read_text(encoding="utf-8", errors="ignore")
+    except Exception: continue
+
+    pkg = PKG_RE.search(text).group(1) if PKG_RE.search(text) else ""
+
+    cls_m = CLASS_RE.search(text)
+    if not cls_m: continue
+    cls = cls_m.group(1)
+
+    ctrl_m = CTRL_NAME_RE.search(text)
+    if ctrl_m and ctrl_m.group(1).endswith("Controller"):
+        cls = ctrl_m.group(1)
+
+    if not looks_like_controller(text, cls): continue
+
+    methods = []
+    for m in METHOD_RE.finditer(text):
+        start = m.start()
+        before = text[max(0, start-500):start]
+        if not is_mapped(before): continue
+        _vis, _static, ret, name, sig = m.group(1), m.group(2), m.group(3), m.group(4), m.group(5)
+        params = parse_params(sig)
+        methods.append((name, params, ret_simplify(ret)))
+
+    deps = collect_deps_fields(text) | collect_deps_ctor(text, cls)
+    controllers[cls] = dict(package=pkg, methods=methods, deps=deps)
+
+all_deps = set().union(*(d["deps"] for d in controllers.values())) if controllers else set()
+
+OUT.parent.mkdir(parents=True, exist_ok=True)
+with OUT.open("w", encoding="utf-8") as f:
+    f.write("@startuml\n")
+    f.write("title Controllers Diagram\n")
+    f.write("hide empty members\nskinparam classAttributeIconSize 0\n")
+    f.write("skinparam classBackgroundColor #ffffff\nskinparam classBorderColor #888\nskinparam ArrowColor #666\n\n")
+
+    for cls, data in sorted(controllers.items()):
+        f.write(f"class {cls} {{\n")
+        for name, params, ret in data["methods"]:
+            param_str = ", ".join(f"{n}: {t}" for n, t in params)
+            f.write(f"  +{name}({param_str}) : {ret}\n")
+        f.write("}\n\n")
+
+    for dep in sorted(all_deps):
+        if dep not in controllers:
+            f.write(f"class {dep}\n")
+    if all_deps: f.write("\n")
+
+    for cls, data in controllers.items():
+        for dep in sorted(data["deps"]):
+            f.write(f"{cls} --> {dep}\n")
+
+    f.write("\n@enduml\n")
+
+print(f"Wrote {OUT} | controllers: {len(controllers)} | deps: {len(all_deps)}")
+PY
+
+          chmod +x scripts/generate_controllers_puml.py
+          python3 scripts/generate_controllers_puml.py src/main/java doc/controllers.puml
+          echo "---- GENERATED FILE LIST ----"
+          ls -lah doc
+          echo "Preview (first 40 lines):"
+          head -n 40 doc/controllers.puml || true
+
+      - name: (Optional) Render to SVG + PNG with PlantUML
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y graphviz curl
+          curl -L -o plantuml.jar https://repo1.maven.org/maven2/net/sourceforge/plantuml/plantuml/1.2024.7/plantuml-1.2024.7.jar
+          java -jar plantuml.jar -tsvg doc/controllers.puml
+          java -jar plantuml.jar -tpng doc/controllers.puml
+          ls -lah doc
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: controllers-diagram
+          path: |
+            doc/controllers.puml
+            doc/controllers.svg
+            doc/controllers.png
