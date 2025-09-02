@@ -1,7 +1,7 @@
 name: Generate Controllers PlantUML
 
 on:
-  workflow_dispatch:  # run it manually from the Actions tab
+  workflow_dispatch: # run it manually from the Actions tab
 
 jobs:
   controllers-diagram:
@@ -24,15 +24,6 @@ jobs:
 #!/usr/bin/env python3
 import re, sys
 from pathlib import Path
-
-# Usage:
-#   python3 scripts/generate_controllers_puml.py src/main/java doc/controllers.puml
-#
-# It:
-# - Finds Spring MVC controllers (class ends with *Controller or annotated with @RestController/@Controller)
-# - Captures request-mapped public methods (@GetMapping/@PostMapping/@PutMapping/@DeleteMapping/@PatchMapping/@RequestMapping)
-# - Detects DI deps whose type names end with Service/Repository/Client/Manager/Facade (fields or constructor params)
-# - Emits a PlantUML class diagram for controllers with arrows to these deps.
 
 SRC_DIR = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("src/main/java")
 OUT = Path(sys.argv[2]) if len(sys.argv) > 2 else Path("controllers.puml")
@@ -111,7 +102,7 @@ def collect_deps_ctor(text: str, cls: str):
 def ret_simplify(ret: str) -> str:
     return sanitize_type(ret)
 
-controllers = {}  # name -> {package, methods[(name,[(n,t)],ret)], deps:set[str]}
+controllers = {}
 
 java_files = list(SRC_DIR.rglob("*.java"))
 for file in java_files:
@@ -119,7 +110,6 @@ for file in java_files:
     except Exception: continue
 
     pkg = PKG_RE.search(text).group(1) if PKG_RE.search(text) else ""
-
     cls_m = CLASS_RE.search(text)
     if not cls_m: continue
     cls = cls_m.group(1)
